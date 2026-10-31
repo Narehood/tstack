@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""preflight: verify tools and auth before a mobile-build run.
+
+  preflight [--app path] [--platform ios|android|all]
+
+Checks gh, eas-cli login, Node/npm, and that the app's eas.json has a
+production profile. Stdout carries one status line per check. Stderr carries
+progress. Exit 0 when ready, 1 when something is missing, 2 on bad input.
+
+Windows-safe: Python 3 stdlib only, no fcntl or Unix-only modules. On Windows,
+prefer `py -3 path\\to\\preflight` when `python3` is not on PATH.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+
+def log(message: str) -> None:
+    print(f"preflight: {message}", file=sys.stderr, flush=True)
+
+
+def fail(message: str, code: int = 2) -> NoReturn:
+    print(f"preflight: {message}", flush=True)
+    sys.exit(code)
+
+
+def which(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def run(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def ok(label: str, detail: str) -> None:
+    print(f"ok  {label}: {detail}", flush=True)
+
+
+def bad(label: str, detail: str) -> None:
+    print(f"fail {label}: {detail}", flush=True)
+
+
+def find_eas_json(app: Path) -> Path | None:
+    direct = app / "eas.json"
+    if direct.is_file():
+        return direct
+    # Walk up a few levels for apps that keep eas.json at a parent package.
+    for parent in list(app.parents)[:4]:
+        candidate = parent / "eas.json"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def has_production_profile(eas_json: Path) -> tuple[bool, str]:
+    try:
+        data = json.loads(eas_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return False, f"cannot read {eas_json}: {exc}"
+    build = data.get("build")
+    if not isinstance(build, dict):
+        return False, f"{eas_json} has no build profiles"
+    if "production" not in build:
+        profiles = ", ".join(sorted(build)) or "(none)"
+        return False, f"no production profile (have: {profiles})"
+    return True, str(eas_json)
+
+
+def check_gh() -> bool:
+    if not which("gh"):
+        bad("gh", "not found on PATH")
+        return False
+    result = run(["gh", "auth", "status"])
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "not authenticated").strip()
+        bad("gh", detail.splitlines()[-1] if detail else "not authenticated")
+        return False
+    ok("gh", "authenticated")
+    return True
+
+
+def check_eas(app: Path | None) -> bool:
+    eas = which("eas")
+    npx = which("npx")
+    if eas:
+        argv = ["eas", "whoami"]
+    elif npx:
+        argv = ["npx", "--yes", "eas-cli", "whoami"]
+    else:
+        bad("eas", "eas-cli not found (install eas-cli or ensure npx is available)")
+        return False
+    result = run(argv, cwd=app)
+    out = (result.stdout or result.stderr or "").strip()
+    if result.returncode != 0:
+        bad("eas", out.splitlines()[-1] if out else "not logged in")
+        return False
+    who = out.splitlines()[-1] if out else "logged in"
+    ok("eas", who)
+    return True
+
+
+def check_node() -> bool:
+    node = which("node")
+    npm = which("npm")
+    if not node:
+        bad("node", "not found on PATH")
+        return False
+    if not npm:
+        bad("npm", "not found on PATH")
+        return False
+    node_v = run(["node", "-v"])
+    npm_v = run(["npm", "-v"])
+    ok(
+        "node",
+        f"{(node_v.stdout or '').strip()} / npm {(npm_v.stdout or '').strip()}",
+    )
+    return True
+
+
+def check_app(app: Path | None, require_app: bool) -> bool:
+    if app is None:
+        if require_app:
+            bad("app", "pass --app path to an Expo/EAS app")
+            return False
+        ok("app", "not set yet (resolve with find-apps before building)")
+        return True
+    if not app.is_dir():
+        bad("app", f"not a directory: {app}")
+        return False
+    markers = [
+        app / "app.json",
+        app / "app.config.js",
+        app / "app.config.ts",
+        app / "app.config.mjs",
+    ]
+    if not any(m.is_file() for m in markers):
+        bad("app", f"no app.json / app.config.* under {app}")
+        return False
+    eas_json = find_eas_json(app)
+    if eas_json is None:
+        bad("eas.json", f"not found for {app}")
+        return False
+    good, detail = has_production_profile(eas_json)
+    if not good:
+        bad("production", detail)
+        return False
+    ok("app", f"{app} (production profile in {detail})")
+    return True
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--app", type=Path, help="path to the Expo/EAS app")
+    parser.add_argument(
+        "--platform",
+        choices=("ios", "android", "all"),
+        default="all",
+        help="build platform for this run (default: all)",
+    )
+    parser.add_argument(
+        "--require-app",
+        action="store_true",
+        help="fail when --app is omitted",
+    )
+    args = parser.parse_args(argv)
+
+    app = args.app.resolve() if args.app else None
+    log(f"platform={args.platform} app={app or '(unset)'}")
+
+    checks = [
+        check_gh(),
+        check_node(),
+        check_eas(app),
+        check_app(app, args.require_app),
+    ]
+    if all(checks):
+        print(f"ready platform={args.platform}", flush=True)
+        return 0
+    print("not ready", flush=True)
+    return 1
+
+
+if __name__ == "__main__":
+    # Avoid Windows console issues with empty argv edge cases.
+    sys.exit(main(sys.argv[1:]))
