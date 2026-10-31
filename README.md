@@ -18,6 +18,9 @@ not.
 | `babysit-pr` | "babysit" | Watches a PR through CI and review bots, and fixes the real findings. |
 | `modernize` | "modernize" | Rebases an old PR and decides if it should still exist. |
 | `leaving-pr-comments` | (automatic) | Formats comments that an agent posts on your behalf. |
+| `mobile-build` | "mobile build" | Updates Expo packages, merges open PRs after you confirm, waits for green CI, then runs a production EAS build for both platforms (TestFlight for iOS). |
+| `ios-build` | "ios build" | Same as `mobile-build`, but iOS only, then TestFlight. |
+| `android-build` | "android build" | Same as `mobile-build`, but Android only. Stops after a successful build. |
 
 Some skills call others. Install the ones they need too:
 
@@ -25,6 +28,7 @@ Some skills call others. Install the ones they need too:
 - `full-stop` uses `full-send`.
 - `takeover` uses `modernize`, `file-pr`, `babysit-pr`, and `leaving-pr-comments`.
 - `file-pr`, `babysit-pr`, and `modernize` use `leaving-pr-comments`.
+- `mobile-build`, `ios-build`, and `android-build` use `file-pr` and `babysit-pr`. Install `mobile-build` whenever you install the platform variants; they read its workflow.
 
 ## Install
 
@@ -37,7 +41,13 @@ cp -R tstack/skills/* ~/.codex/skills/    # Codex
 ## Requirements
 
 - An authenticated [GitHub CLI](https://cli.github.com) (`gh`).
-- `python3` for `babysit-pr`'s `pr-wait` script.
+- `python3` for `babysit-pr`'s `pr-wait` script and for `mobile-build`'s
+  `preflight`, `ci-wait`, and `find-apps` scripts. On Windows, `py -3` works
+  when `python3` is not on PATH. The mobile-build scripts avoid Unix-only
+  modules such as `fcntl`.
+- [EAS CLI](https://docs.expo.dev/build/setup/) logged in (`eas whoami`) for
+  `mobile-build`, `ios-build`, and `android-build`. The app needs an
+  `eas.json` with a `production` profile.
 - `council` and `sol-loop` need subagents on other providers' models. T3 Code
   does this with `delegate_task`. Otherwise you need a harness that can run
   those models.

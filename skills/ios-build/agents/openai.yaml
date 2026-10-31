@@ -1,0 +1,4 @@
+interface:
+  display_name: "iOS Build"
+  short_description: "Update, merge with OK, green CI, EAS iOS production build, then TestFlight"
+  default_prompt: "Use $ios-build to update packages, merge open PRs after I confirm, wait for green CI, run a production EAS iOS build, and submit to TestFlight."

@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""ci-wait: watch CI on a branch tip until green or failed.
+
+  ci-wait [--repo owner/name] [--ref branch] [--interval 20]
+
+Without --repo / --ref, values come from the current checkout's gh default
+remote and its default branch. Stdout carries only events, one line each.
+Progress and non-fatal errors go to stderr.
+
+Exit codes
+  0  checks on the tip are green
+  1  a check failed, or GitHub stayed unreachable
+  2  bad arguments or unknown ref
+
+Windows-safe: Python 3 stdlib only, no fcntl. On Windows, prefer
+`py -3 path\\to\\ci-wait` when `python3` is not on PATH.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+from collections.abc import Sequence
+from typing import Any, NoReturn
+
+FAILED = ("fail", "cancel")
+RANK = {"fail": 4, "cancel": 3, "pending": 2, "pass": 1, "skipping": 0}
+TRANSIENT = re.compile(
+    r"HTTP (5\d\d|429)|rate limit|timed? ?out|connection (reset|refused)|EOF|"
+    r"temporar|could not resolve host|TLS handshake|Something went wrong",
+    re.IGNORECASE,
+)
+MAX_FAILED_POLLS = 10
+
+
+def log(message: str) -> None:
+    print(f"ci-wait: {message}", file=sys.stderr, flush=True)
+
+
+def fail(message: str, code: int = 2) -> NoReturn:
+    print(f"ci-wait: {message}", flush=True)
+    sys.exit(code)
+
+
+def event(message: str) -> None:
+    print(message, flush=True)
+
+
+def run_gh(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["gh", *args],
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+class GhError(Exception):
+    def __init__(self, message: str, transient: bool) -> None:
+        super().__init__(message)
+        self.transient = transient
+
+
+def resolve_repo(repo: str | None) -> str:
+    if repo:
+        if not re.fullmatch(r"[^/]+/[^/]+", repo):
+            fail(f"bad --repo value: {repo}")
+        return repo
+    result = run_gh(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+    if result.returncode != 0:
+        fail((result.stderr or result.stdout or "cannot resolve repo").strip())
+    name = (result.stdout or "").strip()
+    if not name:
+        fail("cannot resolve repo; pass --repo owner/name")
+    return name
+
+
+def resolve_ref(repo: str, ref: str | None) -> str:
+    if ref:
+        return ref
+    result = run_gh(["api", f"repos/{repo}", "--jq", ".default_branch"])
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "cannot resolve default branch").strip()
+        raise GhError(err, bool(TRANSIENT.search(err)))
+    data = (result.stdout or "").strip()
+    if not data:
+        fail("cannot resolve default branch; pass --ref")
+    return data
+
+
+def tip_sha(repo: str, ref: str) -> str:
+    # Prefer the git ref API so tags and branches both work.
+    result = run_gh(
+        ["api", f"repos/{repo}/commits/{ref}", "--jq", ".sha"]
+    )
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "cannot resolve ref").strip()
+        raise GhError(err, bool(TRANSIENT.search(err)))
+    sha = (result.stdout or "").strip()
+    if not sha:
+        raise GhError(f"empty sha for {repo}@{ref}", False)
+    return sha
+
+
+def check_runs(repo: str, sha: str) -> list[dict[str, Any]]:
+    # REST list; paginate lightly via gh --paginate.
+    result = run_gh(
+        [
+            "api",
+            "--paginate",
+            f"repos/{repo}/commits/{sha}/check-runs",
+            "--jq",
+            ".check_runs",
+        ]
+    )
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "check-runs failed").strip()
+        raise GhError(err, bool(TRANSIENT.search(err)))
+    text = (result.stdout or "").strip()
+    if not text:
+        return []
+    # --paginate may emit multiple JSON arrays. Flatten.
+    runs: list[dict[str, Any]] = []
+    decoder = json.JSONDecoder()
+    idx = 0
+    while idx < len(text):
+        while idx < len(text) and text[idx].isspace():
+            idx += 1
+        if idx >= len(text):
+            break
+        chunk, offset = decoder.raw_decode(text, idx)
+        idx = offset
+        if isinstance(chunk, list):
+            runs.extend(item for item in chunk if isinstance(item, dict))
+    return runs
+
+
+def status_contexts(repo: str, sha: str) -> list[dict[str, Any]]:
+    result = run_gh(["api", f"repos/{repo}/commits/{sha}/status"])
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "status failed").strip()
+        raise GhError(err, bool(TRANSIENT.search(err)))
+    data = json.loads(result.stdout or "{}")
+    statuses = data.get("statuses") or []
+    return [s for s in statuses if isinstance(s, dict)]
+
+
+def bucket_check(run: dict[str, Any]) -> str:
+    conclusion = (run.get("conclusion") or "").lower()
+    status = (run.get("status") or "").lower()
+    if status != "completed":
+        return "pending"
+    if conclusion in ("success", "neutral", "skipped"):
+        return "pass" if conclusion != "skipped" else "skipping"
+    if conclusion in ("failure", "timed_out", "action_required"):
+        return "fail"
+    if conclusion == "cancelled":
+        return "cancel"
+    return "pending"
+
+
+def bucket_status(status: dict[str, Any]) -> str:
+    state = (status.get("state") or "").lower()
+    if state == "success":
+        return "pass"
+    if state in ("failure", "error"):
+        return "fail"
+    if state == "pending":
+        return "pending"
+    return "pending"
+
+
+def summarize(
+    runs: list[dict[str, Any]], statuses: list[dict[str, Any]]
+) -> tuple[str, list[str], list[str]]:
+    """Return overall bucket, failing names, pending names."""
+    by_name: dict[str, tuple[int, str]] = {}
+    for run in runs:
+        name = str(run.get("name") or run.get("id") or "check")
+        bucket = bucket_check(run)
+        rank = RANK.get(bucket, 0)
+        prev = by_name.get(name)
+        if prev is None or rank > prev[0]:
+            by_name[name] = (rank, bucket)
+    for status in statuses:
+        name = str(status.get("context") or status.get("id") or "status")
+        bucket = bucket_status(status)
+        rank = RANK.get(bucket, 0)
+        prev = by_name.get(name)
+        if prev is None or rank > prev[0]:
+            by_name[name] = (rank, bucket)
+
+    if not by_name:
+        # No checks configured: treat as green so a build can proceed.
+        return "pass", [], []
+
+    failing = [name for name, (_, b) in sorted(by_name.items()) if b in FAILED]
+    pending = [name for name, (_, b) in sorted(by_name.items()) if b == "pending"]
+    if failing:
+        return "fail", failing, pending
+    if pending:
+        return "pending", failing, pending
+    return "pass", failing, pending
+
+
+def html_url_for_sha(repo: str, sha: str) -> str:
+    return f"https://github.com/{repo}/commit/{sha}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--repo", help="owner/name (default: current checkout)")
+    parser.add_argument("--ref", help="branch or tag (default: repo default branch)")
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=20,
+        help="seconds between polls (default: 20)",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="poll once and exit 0/1 without waiting",
+    )
+    args = parser.parse_args(argv)
+    if args.interval < 5:
+        fail("--interval must be >= 5")
+
+    try:
+        repo = resolve_repo(args.repo)
+        ref = resolve_ref(repo, args.ref)
+    except GhError as exc:
+        fail(str(exc), 1 if exc.transient else 2)
+
+    log(f"watching {repo}@{ref} every {args.interval}s")
+    last_sha = ""
+    last_bucket = ""
+    failed_polls = 0
+
+    while True:
+        try:
+            sha = tip_sha(repo, ref)
+            runs = check_runs(repo, sha)
+            statuses = status_contexts(repo, sha)
+            bucket, failing, pending = summarize(runs, statuses)
+            failed_polls = 0
+        except GhError as exc:
+            failed_polls += 1
+            log(f"poll error ({failed_polls}/{MAX_FAILED_POLLS}): {exc}")
+            if failed_polls >= MAX_FAILED_POLLS:
+                event(f"gave up after {MAX_FAILED_POLLS} failed polls on {repo}@{ref}")
+                return 1
+            if args.once:
+                return 1
+            time.sleep(args.interval)
+            continue
+
+        short = sha[:7]
+        if sha != last_sha:
+            event(f"tip {short} on {ref} {html_url_for_sha(repo, sha)}")
+            last_sha = sha
+            last_bucket = ""
+
+        if bucket != last_bucket:
+            if bucket == "pending":
+                event(
+                    f"pending on {short}: {', '.join(pending) if pending else 'checks running'}"
+                )
+            elif bucket == "fail":
+                event(f"failed on {short}: {', '.join(failing)}")
+            elif bucket == "pass":
+                event(f"green on {short} {html_url_for_sha(repo, sha)}")
+            last_bucket = bucket
+
+        if bucket == "pass":
+            return 0
+        if bucket == "fail":
+            return 1
+        if args.once:
+            return 1
+
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        event("interrupted")
+        sys.exit(130)

@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""find-apps: list Expo/EAS app directories under a monorepo root.
+
+  find-apps [root]
+
+Prints one absolute app path per line. An app is a directory with app.json or
+app.config.* (js/ts/mjs/cjs). Prefer directories that also have eas.json, but
+still list Expo apps without it so the agent can report the gap.
+
+Skips node_modules, .git, dist, build, and similar noise. Exit 0 always when
+the walk succeeds (including zero matches), 2 on bad input.
+
+Windows-safe: Python 3 stdlib only, no fcntl.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".turbo",
+    ".next",
+    ".expo",
+    "node_modules",
+    "dist",
+    "build",
+    "coverage",
+    "ios",
+    "android",
+    "Pods",
+    "__pycache__",
+}
+
+APP_CONFIGS = (
+    "app.json",
+    "app.config.js",
+    "app.config.ts",
+    "app.config.mjs",
+    "app.config.cjs",
+)
+
+
+def fail(message: str, code: int = 2) -> None:
+    print(f"find-apps: {message}", flush=True)
+    sys.exit(code)
+
+
+def is_app_dir(path: Path) -> bool:
+    return any((path / name).is_file() for name in APP_CONFIGS)
+
+
+def walk(root: Path) -> list[Path]:
+    found: list[Path] = []
+
+    def recurse(current: Path) -> None:
+        if is_app_dir(current):
+            found.append(current.resolve())
+            # Still look one level under apps/* style layouts? Usually the app
+            # root is the config root; do not descend into nested example apps
+            # inside an already-detected app unless they are separate packages.
+            # Descend only into workspace package folders that are not the app
+            # itself's node_modules (already skipped).
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            return
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            if entry.name in SKIP_DIRS or entry.name.startswith("."):
+                continue
+            # If current is an app, only descend into packages/ or apps/ style
+            # children that might host nested apps in unusual layouts.
+            if is_app_dir(current) and entry.name not in {"apps", "packages", "examples"}:
+                continue
+            recurse(entry)
+
+    recurse(root)
+    # Stable unique paths.
+    uniq: list[Path] = []
+    seen: set[Path] = set()
+    for path in found:
+        if path not in seen:
+            seen.add(path)
+            uniq.append(path)
+    return uniq
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "root",
+        nargs="?",
+        default=".",
+        type=Path,
+        help="monorepo or project root (default: cwd)",
+    )
+    args = parser.parse_args(argv)
+    root = args.root.resolve()
+    if not root.is_dir():
+        fail(f"not a directory: {root}")
+
+    apps = walk(root)
+    for app in apps:
+        eas = "eas" if (app / "eas.json").is_file() else "no-eas"
+        # Machine-friendly: path first. Annotation after a tab for humans.
+        print(f"{app}\t{eas}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
